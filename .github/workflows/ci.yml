@@ -1,0 +1,14 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    uses: 0xmichalis/repo-tooling/.github/workflows/rust-ci.yml@b0348b137321be8ef7f962f22fa67cab4eee5bf8
