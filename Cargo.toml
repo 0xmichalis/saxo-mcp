@@ -1,0 +1,32 @@
+[package]
+name = "saxo-mcp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Read-only Saxo Bank OpenAPI MCP server: accounts, balances, positions, orders, transactions and costs"
+authors = ["Michalis Kargakis <kargakis@protonmail.com>"]
+readme = "README.md"
+keywords = ["mcp", "saxo", "saxo-bank", "openapi", "finance"]
+categories = ["api-bindings"]
+
+[dependencies]
+base64 = "0.23"
+dotenvy = "0.15.7"
+getrandom = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "query", "form", "charset"] }
+rmcp = { version = "3.9.0", features = ["schemars", "transport-io"] }
+schemars = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "net", "io-util", "sync"] }
+
+[dev-dependencies]
+cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
+rmcp = { version = "3.9.0", features = ["client"] }
+wiremock = "0.6.5"
+
+[profile.release]
+strip = true
+lto = true
