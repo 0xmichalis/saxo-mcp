@@ -1,0 +1,35 @@
+name: Release
+
+# Publish a GitHub Release with prebuilt binaries when a version tag is pushed:
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Linux is built for musl, so the binary is statically linked (no libc dependency)
+# and runs on any x86_64 Linux regardless of the host's glibc version. macOS is
+# built for both architectures; Apple does not support static libc linking, but
+# the binaries need nothing beyond the system libraries every Mac has.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and release (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    uses: 0xmichalis/repo-tooling/.github/workflows/rust-binary-release.yml@b0348b137321be8ef7f962f22fa67cab4eee5bf8
+    permissions:
+      contents: write
+    with:
+      binary: saxo-mcp
+      tag: ${{ inputs.tag || github.ref_name }}
+      targets: |
+        [
+          {"target":"x86_64-unknown-linux-musl","os":"ubuntu-latest","builder":"cross"},
+          {"target":"aarch64-apple-darwin","os":"macos-latest","builder":"cargo"},
+          {"target":"x86_64-apple-darwin","os":"macos-latest","builder":"cargo"}
+        ]
