@@ -49,10 +49,10 @@ Things Saxo decides, not this server:
   followed only while they point back into the gateway, so the bearer token is never sent
   anywhere else.
 - **What the token can do** is set by Saxo, per application. Create the app without
-  trading enabled (see Setup). Saxo assigns each app a set of claims; an app whose claims
-  include Write access to personal resources yields tokens that could place orders if used
-  by other software. The developer portal lists the claims it allocated to your app next to
-  its AppKey. Unless you have checked both, treat the token file as a trading credential.
+  trading enabled (see Setup): Saxo then refuses to place orders with its tokens (HTTP 403,
+  "You do not have permission to perform this action", observed on SIM; order prechecks,
+  which place nothing, are still answered). An app with trading enabled yields tokens that
+  could place orders if used by other software, so its token file is a trading credential.
 - The token file is created `0600` in a `0700` directory and replaced atomically. Errors and
   logs never include tokens, the AppSecret, authorization codes or token-endpoint bodies.
 
@@ -120,8 +120,8 @@ variables take precedence):
 saxo-mcp auth
 ```
 
-It prints a Saxo login URL and waits on the redirect address for Saxo to send the browser
-back. On a headless host, forward the redirect port from the machine with the browser
+It prints a Saxo login URL, opens it in the default browser when run on a desktop, and
+waits on the redirect address for Saxo to send the browser back. On a headless host, forward the redirect port from the machine with the browser
 first, then run `saxo-mcp auth` in that SSH session:
 
 ```sh

@@ -6,7 +6,7 @@
 //! Configuration comes from environment variables, also loaded from a `.env`
 //! file in the working directory; see `config.rs` and the README.
 
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 use std::sync::Arc;
 
 use rmcp::ServiceExt;
@@ -79,6 +79,9 @@ async fn login() -> Result<(), String> {
     );
     let status = auth::login(&config, |url| {
         eprintln!("\nOpen this URL in a browser and sign in:\n\n  {url}\n");
+        if open_in_browser(url) {
+            eprintln!("Opened it in your default browser.");
+        }
         eprintln!("Waiting for Saxo to redirect back...");
     })
     .await
@@ -94,4 +97,73 @@ async fn login() -> Result<(), String> {
             .unwrap_or_default()
     );
     Ok(())
+}
+
+/// Hand `url` to the desktop's browser. Returns whether an opener started; the
+/// printed URL remains the fallback.
+fn open_in_browser(url: &str) -> bool {
+    let set = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    let Some(opener) = browser_opener(std::env::consts::OS, set) else {
+        return false;
+    };
+    let child = Command::new(opener)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match child {
+        // An opener may run as long as the browser it starts; reap it whenever.
+        Ok(mut child) => {
+            std::thread::spawn(move || child.wait());
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// The command that opens a URL on this machine's desktop, if it has one. In an
+/// SSH session the browser belongs on the other end of the tunnel, and a
+/// terminal-only host would get a text browser in place of the prompt.
+fn browser_opener(os: &str, set: impl Fn(&str) -> bool) -> Option<&'static str> {
+    if set("SSH_CONNECTION") || set("SSH_TTY") {
+        return None;
+    }
+    match os {
+        "macos" => Some("open"),
+        "linux" | "freebsd" | "openbsd" | "netbsd" => {
+            (set("DISPLAY") || set("WAYLAND_DISPLAY")).then_some("xdg-open")
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vars<'a>(set: &'a [&'a str]) -> impl Fn(&str) -> bool + 'a {
+        move |name| set.contains(&name)
+    }
+
+    #[test]
+    fn opens_a_browser_only_on_a_local_desktop() {
+        assert_eq!(
+            browser_opener("linux", vars(&["DISPLAY"])),
+            Some("xdg-open")
+        );
+        assert_eq!(
+            browser_opener("linux", vars(&["WAYLAND_DISPLAY"])),
+            Some("xdg-open")
+        );
+        assert_eq!(browser_opener("macos", vars(&[])), Some("open"));
+
+        assert_eq!(browser_opener("linux", vars(&[])), None);
+        assert_eq!(
+            browser_opener("linux", vars(&["DISPLAY", "SSH_CONNECTION"])),
+            None
+        );
+        assert_eq!(browser_opener("macos", vars(&["SSH_TTY"])), None);
+        assert_eq!(browser_opener("windows", vars(&["DISPLAY"])), None);
+    }
 }
