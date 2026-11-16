@@ -2,6 +2,7 @@
 //! and a local stand-in for the Saxo gateway. Checks which Saxo resources each
 //! tool reads, with which parameters, and what it hands back.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use reqwest::Url;
@@ -15,7 +16,7 @@ use saxo_mcp::config::{Config, Environment};
 use saxo_mcp::mcp::SaxoServer;
 use saxo_mcp::saxo::SaxoClient;
 use serde_json::{Value, json};
-use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const CLIENT_KEY: &str = "Ck/9+x==";
@@ -23,6 +24,20 @@ const CLIENT_KEY: &str = "Ck/9+x==";
 struct Harness {
     gateway: MockServer,
     client: RunningService<RoleClient, ()>,
+    token_file: PathBuf,
+}
+
+/// A signed-in session with the given access token, valid for 20 minutes.
+fn session(access: &str) -> TokenSet {
+    TokenSet {
+        env: Environment::Sim,
+        app_key: "app".to_string(),
+        access_token: access.to_string(),
+        access_expires_at: unix_now() + 1200,
+        refresh_token: format!("{access}-refresh"),
+        refresh_expires_at: Some(unix_now() + 3600),
+        code_verifier: None,
+    }
 }
 
 impl Harness {
@@ -32,25 +47,13 @@ impl Harness {
             std::env::temp_dir().join(format!("saxo-mcp-tools-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let token_file = dir.join("sim-tokens.json");
-        store::save(
-            &token_file,
-            &TokenSet {
-                env: Environment::Sim,
-                app_key: "app".to_string(),
-                access_token: "access".to_string(),
-                access_expires_at: unix_now() + 1200,
-                refresh_token: "refresh".to_string(),
-                refresh_expires_at: Some(unix_now() + 3600),
-                code_verifier: None,
-            },
-        )
-        .unwrap();
+        store::save(&token_file, &session("access")).unwrap();
         let config = Config {
             env: Environment::Sim,
             app_key: "app".to_string(),
             app_secret: None,
             redirect_uri: Url::parse("http://localhost:8765/callback").unwrap(),
-            token_file,
+            token_file: token_file.clone(),
             gateway_url: format!("{}/sim/openapi", gateway.uri()),
             auth_url: gateway.uri(),
         };
@@ -67,7 +70,11 @@ impl Harness {
             }
         });
         let client = ().serve(client_io).await.unwrap();
-        Self { gateway, client }
+        Self {
+            gateway,
+            client,
+            token_file,
+        }
     }
 
     async fn mock(&self, resource: &str, body: Value) {
@@ -534,4 +541,46 @@ async fn performance_summary_takes_dates_account_and_field_groups() {
 
     assert_eq!(out, json!({ "Allocation": {} }));
     assert!(error_text(&bad).contains("unknown field group"));
+}
+
+#[tokio::test]
+async fn a_new_login_for_another_client_gets_its_own_client_key() {
+    let h = Harness::start("switch-client").await;
+    for (bearer, key) in [("access", CLIENT_KEY), ("second", "Second/Key")] {
+        Mock::given(method("GET"))
+            .and(path("/sim/openapi/port/v1/clients/me"))
+            .and(header("authorization", format!("Bearer {bearer}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ClientKey": key })))
+            .expect(1)
+            .mount(&h.gateway)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/sim/openapi/hist/v1/transactions"))
+            .and(header("authorization", format!("Bearer {bearer}")))
+            .and(query_param("ClientKey", key))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "Data": [{ "TransactionId": bearer }] })),
+            )
+            .expect(1)
+            .mount(&h.gateway)
+            .await;
+    }
+    let range = json!({ "from_date": "2026-01-01", "to_date": "2026-01-31" });
+    let first = structured(&h.call("saxo_transactions", range.clone()).await);
+    assert_eq!(first["transactions"][0]["TransactionId"], "access");
+
+    // Another client signs in with `saxo-mcp auth`, and Saxo stops accepting
+    // the old session's token.
+    store::save(&h.token_file, &session("second")).unwrap();
+    Mock::given(header("authorization", "Bearer access"))
+        .respond_with(ResponseTemplate::new(401))
+        .with_priority(1)
+        .mount(&h.gateway)
+        .await;
+    h.mock("port/v1/accounts/me", json!({ "Data": [] })).await;
+    structured(&h.call("saxo_accounts", json!({})).await);
+
+    let second = structured(&h.call("saxo_transactions", range).await);
+    assert_eq!(second["transactions"][0]["TransactionId"], "second");
 }

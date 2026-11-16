@@ -157,6 +157,12 @@ mcp_servers:
     connect_timeout: 60
 ```
 
+Sign in with the same token file:
+
+```sh
+SAXO_ENV=live SAXO_APP_KEY=your-app-key SAXO_TOKEN_FILE=/home/you/.hermes/saxo-mcp/live-tokens.json saxo-mcp auth
+```
+
 Verify: `hermes mcp test saxo` should connect and list the tools; `saxo_session` confirms
 the session.
 

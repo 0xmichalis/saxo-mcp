@@ -90,6 +90,16 @@ struct State {
     /// A refresh token Saxo refused. Until a new login replaces it in the token
     /// file, the session is known to be over without asking Saxo again.
     refused_refresh: Option<String>,
+    /// A rotation Saxo issued that could not be saved. The refresh token it
+    /// replaced is dead, so this is the session until the file takes it.
+    unsaved: Option<Unsaved>,
+}
+
+struct Unsaved {
+    /// The refresh token the token file held when saving failed. If the file
+    /// holds anything else by now, a newer session replaced it.
+    file_holds: String,
+    tokens: TokenSet,
 }
 
 impl TokenManager {
@@ -183,23 +193,31 @@ impl TokenManager {
         state.cached = None;
 
         let _lock = store::lock(&self.token_file).await?;
-        let Some(stored) = store::load(&self.token_file)? else {
+        let Some(mut stored) = store::load(&self.token_file)? else {
             return Err(AuthError::NotSignedIn {
                 env: self.env.as_str(),
                 token_file: self.token_file.clone(),
             });
         };
+        let mut file_holds = stored.refresh_token.clone();
+        if let Some(pending) = state.unsaved.take()
+            && pending.file_holds == file_holds
+        {
+            self.persist(&mut state, &mut file_holds, &pending.tokens);
+            stored = pending.tokens;
+        }
         self.check_owner(&stored)?;
+
+        let ended = |why: &str| AuthError::from(OAuthError::SessionEnded(why.to_string()));
+        if state.refused_refresh.as_deref() == Some(stored.refresh_token.as_str()) {
+            return Err(ended("Saxo refused the refresh token earlier"));
+        }
         if usable(&stored) {
             state.cached = Some(stored.clone());
             return Ok(stored);
         }
-        let ended = |why: &str| AuthError::from(OAuthError::SessionEnded(why.to_string()));
         if stored.refresh_expired(unix_now()) {
             return Err(ended("the refresh token has expired"));
-        }
-        if state.refused_refresh.as_deref() == Some(stored.refresh_token.as_str()) {
-            return Err(ended("Saxo refused the refresh token earlier"));
         }
 
         let fresh = match self.oauth.refresh(&stored).await {
@@ -211,9 +229,25 @@ impl TokenManager {
                 return Err(e.into());
             }
         };
-        store::save(&self.token_file, &fresh)?;
+        self.persist(&mut state, &mut file_holds, &fresh);
         state.cached = Some(fresh.clone());
         Ok(fresh)
+    }
+
+    /// Save tokens that supersede the session whose refresh token the file
+    /// holds. Saxo has already invalidated that refresh token, so if saving
+    /// fails, keep the tokens in memory and try again on the next file read.
+    fn persist(&self, state: &mut State, file_holds: &mut String, tokens: &TokenSet) {
+        match store::save(&self.token_file, tokens) {
+            Ok(()) => *file_holds = tokens.refresh_token.clone(),
+            Err(e) => {
+                eprintln!("saxo-mcp: keeping the refreshed Saxo session in memory: {e}");
+                state.unsaved = Some(Unsaved {
+                    file_holds: file_holds.clone(),
+                    tokens: tokens.clone(),
+                });
+            }
+        }
     }
 
     /// Refuse tokens issued for another environment or application, which

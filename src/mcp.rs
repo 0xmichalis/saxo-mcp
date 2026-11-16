@@ -8,7 +8,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use serde_json::{Value, json};
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
 
 use crate::auth::unix_now;
 use crate::config::Environment;
@@ -26,7 +26,9 @@ const SIM_MOCK_DATA_ID: &str = "001";
 pub struct SaxoServer {
     client: SaxoClient,
     env: Environment,
-    client_key: OnceCell<String>,
+    /// The ClientKey and the access token it was fetched with. A new login,
+    /// picked up from the token file, may be another client's.
+    client_key: Mutex<Option<(String, String)>>,
 }
 
 type Query = Vec<(&'static str, String)>;
@@ -36,23 +38,28 @@ impl SaxoServer {
         Self {
             client,
             env,
-            client_key: OnceCell::new(),
+            client_key: Mutex::new(None),
         }
     }
 
-    /// The signed-in client's ClientKey, fetched once.
-    async fn client_key(&self) -> Result<&str, SaxoError> {
-        self.client_key
-            .get_or_try_init(|| async {
-                let client = self.client.get("port/v1/clients/me", &[]).await?;
-                client
-                    .get("ClientKey")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .ok_or_else(|| SaxoError::Parse("clients/me has no ClientKey".to_string()))
-            })
-            .await
-            .map(String::as_str)
+    /// The signed-in client's ClientKey, fetched again whenever the access
+    /// token changes.
+    async fn client_key(&self) -> Result<String, SaxoError> {
+        let token = self.client.tokens().access_token().await?;
+        let mut cached = self.client_key.lock().await;
+        if let Some((fetched_with, key)) = cached.as_ref()
+            && *fetched_with == token
+        {
+            return Ok(key.clone());
+        }
+        let client = self.client.get("port/v1/clients/me", &[]).await?;
+        let key = client
+            .get("ClientKey")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| SaxoError::Parse("clients/me has no ClientKey".to_string()))?;
+        *cached = Some((token, key.clone()));
+        Ok(key)
     }
 
     /// Query parameters scoping a request to one account, or `None` for the
@@ -62,7 +69,7 @@ impl SaxoServer {
             return Ok(None);
         };
         Ok(Some(vec![
-            ("ClientKey", self.client_key().await?.to_string()),
+            ("ClientKey", self.client_key().await?),
             ("AccountKey", account_key.to_string()),
         ]))
     }
@@ -222,8 +229,9 @@ pub struct PerformanceArgs {
     /// AccountKey from saxo_accounts. Omit for all accounts of the client.
     pub account_key: Option<String>,
     /// Saxo FieldGroups to return. Time series: Balance, Balance_AccountValue,
-    /// Balance_AccountBalance, Balance_CashBalance, Balance_CashTransfer,
-    /// Balance_MonthlyProfitLoss, Balance_YearlyProfitLoss, TimeWeighted,
+    /// Balance_AccountBalance, Balance_Accruals, Balance_Cash,
+    /// Balance_CashTransfer, Balance_SecurityTransfer, Balance_MonthlyProfitLoss,
+    /// Balance_YearlyProfitLoss, TimeWeighted,
     /// TimeWeighted_Accumulated, TimeWeighted_MonthlyReturn,
     /// TimeWeighted_YearlyReturn, KeyFigures, Benchmark, All. Summary:
     /// Allocation, TradeActivity, TradeSummary, TotalCashBalancePerCurrency,
@@ -402,7 +410,7 @@ impl SaxoServer {
         let result = async {
             let (from, to) = date_range(&args.from_date, args.to_date.as_deref())?;
             let mut query = vec![
-                ("ClientKey", self.client_key().await?.to_string()),
+                ("ClientKey", self.client_key().await?),
                 ("FromDate", from),
                 ("ToDate", to),
             ];
@@ -446,7 +454,7 @@ impl SaxoServer {
             let (from, to) = date_range(&args.from_date, args.to_date.as_deref())?;
             let path = format!(
                 "cs/v1/reports/closedPositions/{}/{from}/{to}",
-                path_segment(self.client_key().await?)
+                path_segment(&self.client_key().await?)
             );
             let mut query = Vec::new();
             if let Some(account_key) = non_blank(args.account_key.as_deref()) {
@@ -507,9 +515,11 @@ impl SaxoServer {
 
     #[tool(
         name = "saxo_instrument_search",
-        description = "Find instruments by keyword: Identifier (the Uic), asset type, \
-                       symbol, description, exchange and currency. Use the Uic and asset \
-                       type with saxo_instrument_details and saxo_prices.",
+        description = "Find instruments by keyword: Identifier, SummaryType, asset type, \
+                       symbol, description, exchange and currency. When SummaryType is \
+                       \"Instrument\", Identifier is the Uic to use with its asset type in \
+                       saxo_instrument_details and saxo_prices. A \"ContractOptionRoot\" \
+                       row is an option root, not a contract: its Identifier is not a Uic.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn instrument_search(
@@ -603,7 +613,7 @@ impl SaxoServer {
         default_field_groups: &str,
         args: PerformanceArgs,
     ) -> Result<Value, SaxoError> {
-        let mut query = vec![("ClientKey", self.client_key().await?.to_string())];
+        let mut query = vec![("ClientKey", self.client_key().await?)];
         match args.from_date.as_deref() {
             Some(from) => {
                 let (from, to) = date_range(from, args.to_date.as_deref())?;

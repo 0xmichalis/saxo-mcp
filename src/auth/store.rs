@@ -83,30 +83,33 @@ pub fn load(path: &Path) -> Result<Option<TokenSet>, StoreError> {
     })
 }
 
-/// Replace the token file atomically: write a private temporary file next to it,
-/// flush it to disk, then rename it over the old one.
+/// Replace the token file atomically and durably: write a private temporary
+/// file next to it, flush it, rename it over the old one, then flush the
+/// directory. Callers hold the [`lock`].
 pub fn save(path: &Path, tokens: &TokenSet) -> Result<(), StoreError> {
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-            .map_err(|e| io_error("creating", dir, &e))?;
-    }
+    let dir = parent_dir(path);
+    create_private_dir(dir)?;
     let json = serde_json::to_vec_pretty(tokens)
         .map_err(|e| StoreError(format!("encoding tokens: {}", json_problem(&e))))?;
 
     let tmp = sibling(path, "tmp");
     let write = || -> io::Result<()> {
+        // Under the lock nobody else writes the temporary file, so anything at
+        // its path is a leftover or was planted. Remove it, and create the file
+        // exclusively so that nothing put back in its place gets the tokens.
+        match fs::remove_file(&tmp) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
         let mut file = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
         file.write_all(&json)?;
         file.sync_all()?;
-        fs::rename(&tmp, path)
+        fs::rename(&tmp, path)?;
+        File::open(dir)?.sync_all()
     };
     write().map_err(|e| {
         let _ = fs::remove_file(&tmp);
@@ -123,13 +126,7 @@ pub struct FileLock {
 /// Wait for the exclusive lock over `path`'s token file.
 pub async fn lock(path: &Path) -> Result<FileLock, StoreError> {
     let lock_path = sibling(path, "lock");
-    if let Some(dir) = lock_path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-            .map_err(|e| io_error("creating", dir, &e))?;
-    }
+    create_private_dir(parent_dir(path))?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -143,6 +140,23 @@ pub async fn lock(path: &Path) -> Result<FileLock, StoreError> {
         .await
         .map_err(|e| StoreError(format!("waiting for the token lock: {e}")))?
         .map_err(|e| io_error("locking", &lock_path, &e))
+}
+
+/// The directory holding `path`: its parent, or the current directory.
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Create `dir` and missing parents readable by their owner only. An existing
+/// directory keeps its mode.
+fn create_private_dir(dir: &Path) -> Result<(), StoreError> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| io_error("creating", dir, &e))
 }
 
 fn sibling(path: &Path, extension: &str) -> PathBuf {
@@ -191,6 +205,22 @@ mod tests {
             std::env::temp_dir().join(format!("saxo-mcp-store-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn save_replaces_a_planted_temporary_file_instead_of_writing_through_it() {
+        let dir = temp_dir("planted");
+        let path = dir.join("sim-tokens.json");
+        let elsewhere = dir.join("readable-by-others");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&elsewhere, "untouched").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, sibling(&path, "tmp")).unwrap();
+
+        save(&path, &tokens()).unwrap();
+
+        assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "untouched");
+        assert_eq!(load(&path).unwrap(), Some(tokens()));
+        assert!(!sibling(&path, "tmp").exists());
     }
 
     #[test]

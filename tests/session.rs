@@ -510,3 +510,117 @@ async fn keep_alive_refreshes_ahead_of_expiry() {
     );
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn a_session_whose_refresh_was_refused_is_not_reported_active() {
+    let server = MockServer::start().await;
+    let file = temp_token_file("refused-after-401");
+    store::save(&file, &tokens("revoked-access", 1200, "dead-refresh")).unwrap();
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("Bad Request"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client(&config(&server, &file, None));
+    let err = client.get("port/v1/users/me", &[]).await.unwrap_err();
+    assert!(
+        matches!(&err, SaxoError::Auth(e) if e.needs_login()),
+        "{err:?}"
+    );
+
+    // The access token has not expired yet, but its session has.
+    assert!(client.tokens().status().await.unwrap_err().needs_login());
+    assert!(
+        client
+            .tokens()
+            .access_token()
+            .await
+            .unwrap_err()
+            .needs_login()
+    );
+}
+
+/// Make saving fail: a directory where the temporary file goes cannot be
+/// removed. Returns it, for the test to remove.
+fn block_saving(token_file: &Path) -> PathBuf {
+    let mut name = token_file.file_name().unwrap().to_os_string();
+    name.push(".tmp");
+    let blocker = token_file.with_file_name(name);
+    std::fs::create_dir_all(&blocker).unwrap();
+    blocker
+}
+
+#[tokio::test]
+async fn a_rotation_that_could_not_be_saved_is_kept_and_saved_later() {
+    let server = MockServer::start().await;
+    let file = temp_token_file("unsaved");
+    store::save(&file, &tokens("expired", 0, "refresh-1")).unwrap();
+    for (old, access, new) in [
+        ("refresh-1", "access-2", "refresh-2"),
+        ("refresh-2", "access-3", "refresh-3"),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains(format!("refresh_token={old}&")))
+            .respond_with(token_response(access, new))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let manager = TokenManager::new(&config(&server, &file, None)).unwrap();
+    let blocker = block_saving(&file);
+
+    // Saxo has invalidated refresh-1, so the session lives on in memory.
+    assert_eq!(manager.access_token().await.unwrap(), "access-2");
+    assert_eq!(
+        store::load(&file).unwrap().unwrap().refresh_token,
+        "refresh-1"
+    );
+
+    // Once the file can be written, the next read saves the kept rotation, and
+    // the refresh after it starts from refresh-2.
+    std::fs::remove_dir(&blocker).unwrap();
+    assert_eq!(
+        manager.replace_rejected("access-2").await.unwrap(),
+        "access-3"
+    );
+    assert_eq!(
+        store::load(&file).unwrap().unwrap().refresh_token,
+        "refresh-3"
+    );
+}
+
+#[tokio::test]
+async fn an_unsaved_rotation_yields_to_a_new_login() {
+    let server = MockServer::start().await;
+    let file = temp_token_file("unsaved-then-login");
+    store::save(&file, &tokens("expired", 0, "refresh-1")).unwrap();
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(token_response("access-2", "refresh-2"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let manager = TokenManager::new(&config(&server, &file, None)).unwrap();
+    let blocker = block_saving(&file);
+    assert_eq!(manager.access_token().await.unwrap(), "access-2");
+
+    std::fs::remove_dir(&blocker).unwrap();
+    store::save(&file, &tokens("login-access", 1200, "login-refresh")).unwrap();
+
+    assert_eq!(
+        manager.replace_rejected("access-2").await.unwrap(),
+        "login-access"
+    );
+    assert_eq!(
+        store::load(&file).unwrap().unwrap().refresh_token,
+        "login-refresh"
+    );
+}
