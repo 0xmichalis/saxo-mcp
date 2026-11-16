@@ -108,6 +108,9 @@ impl SaxoClient {
                 Value::Object(body) => body,
                 // 204: nothing to list.
                 Value::Null => Map::new(),
+                // Some resources, such as closed positions when there are
+                // none, answer with a bare array of rows.
+                Value::Array(data) => Map::from_iter([("Data".to_string(), Value::Array(data))]),
                 other => {
                     return Err(SaxoError::Parse(format!(
                         "expected a listing object, got {}",

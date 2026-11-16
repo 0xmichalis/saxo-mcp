@@ -38,8 +38,9 @@ Things Saxo decides, not this server:
   session's trade level, so it stays read-only.
 - **Closed positions** from `saxo_positions` stay empty for accounts on end-of-day
   netting; `saxo_closed_positions` reads them from Saxo's reports instead.
-- **SIM** has no live market data and little history: performance tools ask for Saxo's
-  mock data, and transactions may be empty.
+- **SIM** quotes FX but returns `NoAccess` for stocks, and has no history of its own: the
+  performance and closed-position reports return Saxo's demo data, and transactions are
+  empty.
 
 ## Security
 

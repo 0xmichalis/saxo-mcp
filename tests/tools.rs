@@ -584,3 +584,14 @@ async fn a_new_login_for_another_client_gets_its_own_client_key() {
     let second = structured(&h.call("saxo_transactions", range).await);
     assert_eq!(second["transactions"][0]["TransactionId"], "second");
 }
+
+#[tokio::test]
+async fn a_bare_array_listing_is_read_as_rows() {
+    let h = Harness::start("bare-array").await;
+    // What the SIM gateway answers for an account that has closed nothing.
+    h.mock("port/v1/closedpositions/me", json!([])).await;
+
+    let out = structured(&h.call("saxo_positions", json!({ "view": "closed" })).await);
+
+    assert_eq!(out, json!({ "positions": [], "truncated": false }));
+}

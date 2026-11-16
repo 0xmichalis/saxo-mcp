@@ -443,7 +443,8 @@ impl SaxoServer {
         name = "saxo_closed_positions",
         description = "Positions closed in a date range, from Saxo's reports: open and close \
                        price and time, amount, realized P&L and its FX component, and \
-                       opening and closing costs, in instrument and account currency.",
+                       opening and closing costs, in instrument and account currency. \
+                       The simulation environment returns Saxo's demo data.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn closed_positions(
@@ -573,7 +574,8 @@ impl SaxoServer {
                        Quote.DelayedByMinutes says how old a price is (0 = real time); \
                        PriceTypeBid/PriceTypeAsk \"NoAccess\" means the account lacks market \
                        data for that exchange or has not accepted Saxo's OpenAPI market \
-                       data terms. The simulation environment has no live market data.",
+                       data terms. The simulation environment quotes FX but returns NoAccess \
+                       for stocks.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn prices(
