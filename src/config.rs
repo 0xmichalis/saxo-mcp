@@ -167,6 +167,14 @@ fn parse_redirect_uri(value: &str) -> Result<Url, ConfigError> {
             "SAXO_REDIRECT_URI must not carry a query or fragment".to_string(),
         ));
     }
+    if url.port().is_none() {
+        return Err(ConfigError(format!(
+            "SAXO_REDIRECT_URI needs the port `saxo-mcp auth` listens on, such as \
+             http://localhost:8765/callback; PKCE apps register it without a port, \
+             got {}",
+            url.as_str()
+        )));
+    }
     Ok(url)
 }
 
@@ -280,6 +288,27 @@ mod tests {
                 ("SAXO_REDIRECT_URI", uri),
             ]);
             assert!(result.is_err(), "{uri} should be rejected");
+        }
+    }
+
+    #[test]
+    fn redirects_name_the_port_to_listen_on() {
+        let err = config(&[
+            ("SAXO_APP_KEY", "k"),
+            ("HOME", "/h"),
+            ("SAXO_REDIRECT_URI", "http://localhost/callback"),
+        ])
+        .unwrap_err();
+        assert!(err.0.contains("port"), "{err}");
+
+        for uri in ["http://127.0.0.1:9000/cb", "http://localhost:8765/callback"] {
+            let config = config(&[
+                ("SAXO_APP_KEY", "k"),
+                ("HOME", "/h"),
+                ("SAXO_REDIRECT_URI", uri),
+            ])
+            .unwrap();
+            assert_eq!(config.redirect_uri.as_str(), uri);
         }
     }
 

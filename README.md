@@ -47,10 +47,11 @@ Things Saxo decides, not this server:
   the configured environment. HTTP redirects are not followed and Saxo's paging links are
   followed only while they point back into the gateway, so the bearer token is never sent
   anywhere else.
-- **What the token can do** is set by Saxo, per application. Saxo assigns each app a set of
-  claims; an app whose claims include Write access to personal resources yields tokens that
-  could place orders if used by other software. The developer portal lists the claims it
-  allocated to your app next to its AppKey. Treat the token file as a trading credential.
+- **What the token can do** is set by Saxo, per application. Create the app without
+  trading enabled (see Setup). Saxo assigns each app a set of claims; an app whose claims
+  include Write access to personal resources yields tokens that could place orders if used
+  by other software. The developer portal lists the claims it allocated to your app next to
+  its AppKey. Unless you have checked both, treat the token file as a trading credential.
 - The token file is created `0600` in a `0700` directory and replaced atomically. Errors and
   logs never include tokens, the AppSecret, authorization codes or token-endpoint bodies.
 
@@ -84,9 +85,13 @@ Or build from source: `cargo build --release`.
 
 1. Sign up for a free [developer account](https://www.developer.saxo/accounts/sim/signup);
    it comes with a simulation (SIM) account.
-2. In [My Apps](https://www.developer.saxo/openapi/appmanagement), create an application
-   with the **PKCE** grant type (no secret to store) or **Code** (Authorization Code with
-   an AppSecret), and the redirect URL `http://localhost:8765/callback`.
+2. In [My Apps](https://www.developer.saxo/openapi/appmanagement), create an application:
+   - Grant type **PKCE** (no secret to store), with the redirect URL
+     `http://localhost/callback`. Saxo does not register ports for PKCE apps and accepts
+     any port at sign-in. A **Code** app (Authorization Code with an AppSecret) registers
+     the full `http://localhost:8765/callback` instead.
+   - Leave **Allow this app to be enabled for trading** unchecked. It cannot be changed
+     after the app is created.
 3. Note the AppKey (and AppSecret for Code apps) and review the claims Saxo allocated.
    Personal data needs read access to personal resources; nothing here needs write
    access.
@@ -105,7 +110,7 @@ variables take precedence):
 | `SAXO_ENV` | `sim` (default) or `live` |
 | `SAXO_APP_KEY` | The app's AppKey. Required. |
 | `SAXO_APP_SECRET` | The AppSecret of a Code app. Leave unset for PKCE apps. |
-| `SAXO_REDIRECT_URI` | The app's redirect URL, on `localhost` or `127.0.0.1`. Default `http://localhost:8765/callback`. |
+| `SAXO_REDIRECT_URI` | The redirect URL with the port `saxo-mcp auth` listens on, on `localhost` or `127.0.0.1`. Default `http://localhost:8765/callback`. |
 | `SAXO_TOKEN_FILE` | Session file. Default `$XDG_STATE_HOME/saxo-mcp/<env>-tokens.json` (`~/.local/state/...`). |
 
 ### 3. Sign in
