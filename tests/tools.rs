@@ -352,10 +352,28 @@ async fn bad_input_is_refused_before_reaching_saxo() {
     let blank = h
         .call("saxo_instrument_search", json!({ "keywords": "  " }))
         .await;
+    let bad_type = h
+        .call(
+            "saxo_transactions",
+            json!({ "from_date": "2024-02-29", "asset_types": ["Fx Spot"] }),
+        )
+        .await;
+    let bad_date = h
+        .call("saxo_performance", json!({ "from_date": "2025-02-29" }))
+        .await;
+    let bad_field_group = h
+        .call(
+            "saxo_performance_summary",
+            json!({ "field_groups": ["All&MockDataId=002"] }),
+        )
+        .await;
 
     assert!(error_text(&traversal).contains("asset type must be"));
     assert!(error_text(&no_uics).contains("between 1 and 50"));
     assert!(error_text(&blank).contains("keywords must not be empty"));
+    assert!(error_text(&bad_type).contains("asset type must be"));
+    assert!(error_text(&bad_date).contains("YYYY-MM-DD"));
+    assert!(error_text(&bad_field_group).contains("unknown field group"));
 }
 
 #[tokio::test]
@@ -594,4 +612,18 @@ async fn a_bare_array_listing_is_read_as_rows() {
     let out = structured(&h.call("saxo_positions", json!({ "view": "closed" })).await);
 
     assert_eq!(out, json!({ "positions": [], "truncated": false }));
+}
+
+#[tokio::test]
+async fn malformed_listings_are_tool_errors() {
+    let h = Harness::start("malformed-listings").await;
+    h.mock("port/v1/accounts/me", json!({ "Data": {} })).await;
+    h.mock("port/v1/orders/me", json!({ "Data": [], "__next": 42 }))
+        .await;
+
+    let bad_data = h.call("saxo_accounts", json!({})).await;
+    let bad_next = h.call("saxo_orders", json!({})).await;
+
+    assert!(error_text(&bad_data).contains("listing Data must be an array"));
+    assert!(error_text(&bad_next).contains("paging link must be a string"));
 }

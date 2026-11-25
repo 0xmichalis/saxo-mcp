@@ -11,8 +11,8 @@ use saxo_mcp::auth::{AuthError, TokenManager, unix_now};
 use saxo_mcp::config::{Config, Environment};
 use saxo_mcp::saxo::{SaxoClient, SaxoError};
 use serde_json::json;
-use wiremock::matchers::{body_string_contains, header, header_exists, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::matchers::{body_string_contains, header, header_exists, method, path, query_param};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const APP_KEY: &str = "test-app";
 
@@ -324,32 +324,110 @@ async fn paging_follows_next_links_up_to_the_limit() {
         .and(path("/sim/openapi/port/v1/orders/me"))
         .and(wiremock::matchers::query_param_is_missing("$skip"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "__count": 5,
-            // Saxo also sends root-relative links.
-            "__next": "/sim/openapi/port/v1/orders/me?$skip=2&$top=2",
+            "__count": 4,
+            "__next": format!("{base}/port/v1/orders/me?$skip=2&$top=2"),
             "Data": [{ "OrderId": "1" }, { "OrderId": "2" }],
         })))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/sim/openapi/port/v1/orders/me"))
-        .and(wiremock::matchers::query_param("$skip", "2"))
+        .and(query_param("$skip", "2"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "__count": 5,
-            "__next": format!("{base}/port/v1/orders/me?$skip=4&$top=2"),
             "Data": [{ "OrderId": "3" }, { "OrderId": "4" }],
         })))
         .mount(&server)
         .await;
 
-    let rows = client(&config(&server, &file, None))
-        .get_rows("port/v1/orders/me", &[], 3)
-        .await
-        .unwrap();
+    let client = client(&config(&server, &file, None));
+    let rows = client.get_rows("port/v1/orders/me", &[], 3).await.unwrap();
 
     let ids: Vec<_> = rows.rows.iter().map(|r| r["OrderId"].clone()).collect();
     assert_eq!(ids, [json!("1"), json!("2"), json!("3")]);
-    assert_eq!(rows.total, Some(5));
+    assert_eq!(rows.total, Some(4));
+    assert!(rows.truncated);
+
+    let rows = client.get_rows("port/v1/orders/me", &[], 4).await.unwrap();
+    assert_eq!(rows.rows.len(), 4);
+    assert!(!rows.truncated);
+}
+
+#[tokio::test]
+async fn paging_refuses_a_cycle_before_requesting_a_page_twice() {
+    let server = MockServer::start().await;
+    let file = temp_token_file("paging-cycle");
+    store::save(&file, &tokens("access", 600, "refresh")).unwrap();
+    const SENTINEL: &str = "synthetic-cursor-do-not-print";
+    for (cursor, next) in [
+        (
+            SENTINEL,
+            "/sim/openapi/port/v1/orders/me?cursor=next".to_string(),
+        ),
+        (
+            "next",
+            format!("/sim/openapi/port/v1/orders/me?cursor={SENTINEL}#page"),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path("/sim/openapi/port/v1/orders/me"))
+            .and(query_param("cursor", cursor))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "__next": next,
+                "Data": [{ "OrderId": "1" }],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let err = client(&config(&server, &file, None))
+        .get_rows("port/v1/orders/me", &[("cursor", SENTINEL.to_string())], 10)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        err,
+        SaxoError::Parse("paging link repeats a page".to_string())
+    );
+    assert!(!format!("{err:?} {err}").contains(SENTINEL));
+}
+
+#[tokio::test]
+async fn paging_stops_after_twenty_pages_with_a_continuation() {
+    let server = MockServer::start().await;
+    let file = temp_token_file("paging-budget");
+    store::save(&file, &tokens("access", 600, "refresh")).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/sim/openapi/port/v1/orders/me"))
+        .respond_with(|request: &Request| {
+            let (_, skip) = request.url.query_pairs().next().unwrap();
+            let skip = skip.parse::<u32>().unwrap();
+            let next = skip + 1;
+            let next = if skip.is_multiple_of(2) {
+                format!("/sim/openapi/port/v1/orders/me?$skip={next}")
+            } else {
+                format!("?$skip={next}")
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "Data": [{ "OrderId": skip }],
+                "__next": next,
+            }))
+        })
+        .expect(20)
+        .mount(&server)
+        .await;
+
+    let rows = client(&config(&server, &file, None))
+        .get_rows("port/v1/orders/me", &[("$skip", "0".to_string())], 100)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows.rows,
+        (0..20)
+            .map(|skip| json!({"OrderId": skip}))
+            .collect::<Vec<_>>()
+    );
     assert!(rows.truncated);
 }
 
@@ -398,6 +476,35 @@ async fn resource_paths_cannot_climb_out_of_the_gateway() {
         .await
         .unwrap_err();
     assert!(matches!(err, SaxoError::Invalid(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn gateway_diagnostics_omit_keys_in_request_paths() {
+    let server = MockServer::start().await;
+    let file = temp_token_file("invalid-json");
+    store::save(&file, &tokens("access", 600, "refresh")).unwrap();
+    const SENTINEL: &str = "synthetic-key-do-not-print";
+    Mock::given(method("GET"))
+        .and(path(format!("/sim/openapi/report/{SENTINEL}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string("invalid JSON"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = client(&config(&server, &file, None));
+
+    let parse = client
+        .get(&format!("report/{SENTINEL}"), &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(parse, SaxoError::Parse(_)));
+    let invalid = client
+        .get(&format!("../../{SENTINEL}"), &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(invalid, SaxoError::Invalid(_)));
+    for err in [parse, invalid] {
+        assert!(!format!("{err:?} {err}").contains(SENTINEL));
+    }
 }
 
 #[tokio::test]

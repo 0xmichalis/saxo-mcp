@@ -409,11 +409,7 @@ impl SaxoServer {
     ) -> Result<CallToolResult, ErrorData> {
         let result = async {
             let (from, to) = date_range(&args.from_date, args.to_date.as_deref())?;
-            let mut query = vec![
-                ("ClientKey", self.client_key().await?),
-                ("FromDate", from),
-                ("ToDate", to),
-            ];
+            let mut query = vec![("FromDate", from), ("ToDate", to)];
             if let Some(keys) = args.account_keys.filter(|k| !k.is_empty()) {
                 query.push(("AccountKeys", keys.join(",")));
             }
@@ -427,6 +423,7 @@ impl SaxoServer {
                 let uics: Vec<String> = uics.iter().map(u64::to_string).collect();
                 query.push(("Uics", uics.join(",")));
             }
+            query.push(("ClientKey", self.client_key().await?));
             self.rows(
                 "hist/v1/transactions",
                 query,
@@ -615,7 +612,7 @@ impl SaxoServer {
         default_field_groups: &str,
         args: PerformanceArgs,
     ) -> Result<Value, SaxoError> {
-        let mut query = vec![("ClientKey", self.client_key().await?)];
+        let mut query = Vec::new();
         match args.from_date.as_deref() {
             Some(from) => {
                 let (from, to) = date_range(from, args.to_date.as_deref())?;
@@ -638,6 +635,7 @@ impl SaxoServer {
             None => default_field_groups.to_string(),
         };
         query.push(("FieldGroups", field_groups));
+        query.push(("ClientKey", self.client_key().await?));
         self.mock_data(&mut query);
         self.client.get(path, &query).await
     }
@@ -738,9 +736,18 @@ fn parse_date(value: &str) -> Result<String, SaxoError> {
     if !shape_ok {
         return Err(invalid());
     }
+    let year: u32 = value[..4].parse().map_err(|_| invalid())?;
     let month: u32 = value[5..7].parse().map_err(|_| invalid())?;
     let day: u32 = value[8..10].parse().map_err(|_| invalid())?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    let leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days_in_month = match month {
+        2 => 28 + u32::from(leap_year),
+        4 | 6 | 9 | 11 => 30,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => return Err(invalid()),
+    };
+    if !(1..=days_in_month).contains(&day) {
         return Err(invalid());
     }
     Ok(value.to_string())
@@ -823,11 +830,17 @@ mod tests {
             date_range("2026-01-01", Some(" 2026-03-31 ")).unwrap(),
             ("2026-01-01".to_string(), "2026-03-31".to_string())
         );
+        for valid in ["2000-02-29", "2024-02-29", "2026-04-30"] {
+            assert_eq!(parse_date(valid).unwrap(), valid);
+        }
         for bad in [
             "2026-1-01",
             "2026/01/01",
             "2026-13-01",
             "2026-01-32",
+            "1900-02-29",
+            "2024-02-30",
+            "2026-04-31",
             "20260101",
             "x",
         ] {

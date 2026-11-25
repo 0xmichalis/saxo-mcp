@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use reqwest::header::HeaderMap;
 use reqwest::{StatusCode, Url};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::auth::{AuthError, TokenManager};
 
@@ -19,7 +19,7 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Saxo error messages are short; cap them so a misrouted HTML page cannot
 /// flood the tool output.
 const MAX_ERROR_MESSAGE: usize = 300;
-/// Most pages a paged read follows, bounding a runaway listing.
+/// Most pages a paged read fetches, including the first page.
 const MAX_PAGES: usize = 20;
 
 /// Errors from a gateway request.
@@ -89,7 +89,7 @@ impl SaxoClient {
     /// A `204 No Content` answer is `null`.
     pub async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value, SaxoError> {
         let url = self.resource_url(path, query)?;
-        self.get_url(url).await
+        self.get_url(&url).await
     }
 
     /// GET a paged listing (`{"Data": [...], "__next": ...}`) and gather up to
@@ -101,51 +101,49 @@ impl SaxoClient {
         limit: usize,
     ) -> Result<Rows, SaxoError> {
         let mut url = self.resource_url(path, query)?;
+        let mut visited: Vec<Url> = Vec::new();
         let mut rows = Vec::new();
         let mut total = None;
-        for page in 1.. {
-            let mut body = match self.get_url(url).await? {
-                Value::Object(body) => body,
-                // 204: nothing to list.
-                Value::Null => Map::new(),
-                // Some resources, such as closed positions when there are
-                // none, answer with a bare array of rows.
-                Value::Array(data) => Map::from_iter([("Data".to_string(), Value::Array(data))]),
-                other => {
-                    return Err(SaxoError::Parse(format!(
-                        "expected a listing object, got {}",
-                        json_kind(&other)
-                    )));
-                }
-            };
-            total = total.or(body.get("__count").and_then(Value::as_u64));
-            if let Some(Value::Array(data)) = body.remove("Data") {
-                rows.extend(data);
+        let mut truncated = false;
+        for page in 1..=MAX_PAGES {
+            // All pages stay on the gateway. Only the path and query identify
+            // a page there, regardless of spelling of the origin or fragment.
+            if visited
+                .iter()
+                .any(|previous| previous.path() == url.path() && previous.query() == url.query())
+            {
+                return Err(SaxoError::Parse("paging link repeats a page".to_string()));
             }
-            let next = body.get("__next").and_then(Value::as_str);
-            if rows.len() >= limit || next.is_none() || page == MAX_PAGES {
-                let truncated = rows.len() > limit || next.is_some();
-                rows.truncate(limit);
-                return Ok(Rows {
-                    rows,
-                    total,
-                    truncated,
-                });
+            let ListingPage { data, count, next } = ListingPage::parse(self.get_url(&url).await?)?;
+            total = total.or(count);
+            let remaining = limit - rows.len();
+            truncated = data.len() > remaining || next.is_some();
+            rows.extend(data.into_iter().take(remaining));
+
+            let Some(next) = next else { break };
+            if rows.len() == limit || page == MAX_PAGES {
+                break;
             }
-            url = self.next_url(next.unwrap_or_default())?;
+            let next = self.next_url(&url, &next)?;
+            visited.push(url);
+            url = next;
         }
-        unreachable!("the page loop only exits by returning")
+        Ok(Rows {
+            rows,
+            total,
+            truncated,
+        })
     }
 
     fn resource_url(&self, path: &str, query: &[(&str, String)]) -> Result<Url, SaxoError> {
         let mut url = self
             .gateway
             .join(path.trim_start_matches('/'))
-            .map_err(|e| SaxoError::Invalid(format!("resource path {path:?}: {e}")))?;
+            .map_err(|e| SaxoError::Invalid(format!("invalid gateway resource path: {e}")))?;
         if !url.as_str().starts_with(self.gateway.as_str()) {
-            return Err(SaxoError::Invalid(format!(
-                "resource path {path:?} leaves the gateway"
-            )));
+            return Err(SaxoError::Invalid(
+                "resource path leaves the gateway".to_string(),
+            ));
         }
         if !query.is_empty() {
             url.query_pairs_mut()
@@ -156,11 +154,16 @@ impl SaxoClient {
 
     /// Accept a `__next` link only if it points back into the gateway, so the
     /// bearer token never goes anywhere else.
-    /// Saxo sends absolute links, sometimes with an explicit `:443`, or
-    /// root-relative ones; both are resolved against the gateway.
-    fn next_url(&self, next: &str) -> Result<Url, SaxoError> {
-        let url = self
-            .gateway
+    /// Resolve path links against the gateway. A query-only or fragment-only
+    /// link keeps the current resource path.
+    fn next_url(&self, current: &Url, next: &str) -> Result<Url, SaxoError> {
+        let next = next.trim();
+        let base = if next.starts_with(['?', '#']) {
+            current
+        } else {
+            &self.gateway
+        };
+        let url = base
             .join(next)
             .map_err(|e| SaxoError::Parse(format!("paging link is not a URL: {e}")))?;
         let same_origin = url.origin() == self.gateway.origin();
@@ -173,19 +176,23 @@ impl SaxoClient {
         Ok(url)
     }
 
-    async fn get_url(&self, url: Url) -> Result<Value, SaxoError> {
+    async fn get_url(&self, url: &Url) -> Result<Value, SaxoError> {
         let token = self.tokens.access_token().await?;
-        let response = match self.send(&url, &token).await? {
+        let response = match self.send(url, &token).await? {
             (StatusCode::UNAUTHORIZED, _, _) => {
                 let token = self.tokens.replace_rejected(&token).await?;
-                self.send(&url, &token).await?
+                self.send(url, &token).await?
             }
             response => response,
         };
         match response {
             (StatusCode::NO_CONTENT, _, _) => Ok(Value::Null),
-            (status, _, body) if status.is_success() => serde_json::from_str(&body)
-                .map_err(|e| SaxoError::Parse(format!("{e} in the response to {}", url.path()))),
+            (status, _, body) if status.is_success() => serde_json::from_str(&body).map_err(|e| {
+                SaxoError::Parse(format!(
+                    "{e} in the response from {}",
+                    url.host_str().unwrap_or("the gateway")
+                ))
+            }),
             (StatusCode::TOO_MANY_REQUESTS, headers, _) => Err(SaxoError::RateLimited {
                 retry_after: rate_limit_reset(&headers),
             }),
@@ -211,6 +218,52 @@ impl SaxoClient {
             SaxoError::Transport(format!("reading response body: {}", e.without_url()))
         })?;
         Ok((status, headers, body))
+    }
+}
+
+#[derive(Default)]
+struct ListingPage {
+    data: Vec<Value>,
+    count: Option<u64>,
+    next: Option<String>,
+}
+
+impl ListingPage {
+    fn parse(body: Value) -> Result<Self, SaxoError> {
+        let mut body = match body {
+            Value::Object(body) => body,
+            // 204 and some empty listings use null or a bare array.
+            Value::Null => return Ok(Self::default()),
+            Value::Array(data) => {
+                return Ok(Self {
+                    data,
+                    ..Self::default()
+                });
+            }
+            other => {
+                return Err(SaxoError::Parse(format!(
+                    "expected a listing object, got {}",
+                    json_kind(&other)
+                )));
+            }
+        };
+        let data = match body.remove("Data") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(data)) => data,
+            Some(_) => {
+                return Err(SaxoError::Parse(
+                    "listing Data must be an array".to_string(),
+                ));
+            }
+        };
+        let next = match body.remove("__next") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(next)) if next.trim().is_empty() => None,
+            Some(Value::String(next)) => Some(next),
+            Some(_) => return Err(SaxoError::Parse("paging link must be a string".to_string())),
+        };
+        let count = body.get("__count").and_then(Value::as_u64);
+        Ok(Self { data, count, next })
     }
 }
 
@@ -311,8 +364,25 @@ fn truncate(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use reqwest::header::HeaderValue;
+    use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn listing_pages_accept_empty_and_bare_array_responses() {
+        for body in [
+            Value::Null,
+            json!({}),
+            json!({"Data": null, "__next": null}),
+            json!({"Data": [], "__next": ""}),
+        ] {
+            let page = ListingPage::parse(body).unwrap();
+            assert!(page.data.is_empty());
+            assert_eq!(page.next, None);
+        }
+        let page = ListingPage::parse(json!([{"OrderId": "1"}])).unwrap();
+        assert_eq!(page.data, [json!({"OrderId": "1"})]);
+    }
 
     #[test]
     fn api_errors_use_saxo_fields_or_a_short_body() {
